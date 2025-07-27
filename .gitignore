@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+env/
+venv/
+my_tf_env_wsl/
+# IDE/editor
+.vscode/
+.idea/
+deployment/
+# Data & models
+data/
+models/checkpoints/
+*.h5
+*.pkl
+*.onnx
+
+# Notebooks
+notebooks/
+
+# Docker
+wheels/
+*.whl
+*.log

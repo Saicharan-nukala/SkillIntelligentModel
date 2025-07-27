@@ -1,0 +1,3 @@
+Module: https://tfhub.dev/tensorflow/small_bert/bert_en_uncased_L-2_H-128_A-2/1
+Download Time: 2025-07-24 13:48:37.837960
+Downloader Hostname: saispc (PID:1468)

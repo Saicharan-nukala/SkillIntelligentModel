@@ -1,0 +1,27 @@
+# Bytecode & Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+env/
+venv/
+
+# System files
+.DS_Store
+
+# Logs
+*.log
+
+# Editor configs
+.vscode/
+.idea/
+
+# Data folders and notebooks
+data/
+notebooks/
+tests/
+models/checkpoints/
+
+# Git and deployment artifacts
+.git/
+deployment/

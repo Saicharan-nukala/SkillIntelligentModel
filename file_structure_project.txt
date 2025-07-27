@@ -1,0 +1,122 @@
+skill-intelligence-model/
+├── config/
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── model_config.yaml
+│   └── api_config.yaml
+├── data/
+│   ├── raw/
+│   │   ├── external_data/
+│   │   └── skills_dataset.json
+│   ├── processed/
+│   │   └── train_test_split/
+│   ├── schemas/
+│   │   ├── input_schema.json
+│   │   └── output_schema.json
+├── src/
+│   ├── __init__.py
+│   ├── data_processing/
+│   │   ├── __init__.py
+│   │   ├── data_validator.py
+│   │   ├── data_cleaner.py
+│   │   ├── feature_engineer.py
+│   │   ├── relationship_mapper.py
+│   │   └── data_encoder.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── skill_intelligence_model.py
+│   │   ├── neural_architecture.py
+│   │   ├── training_pipeline.py
+│   │   ├── evaluation_metrics.py
+│   │   └── onnx_converter.py
+│   ├── analytics/
+│   │   ├── __init__.py
+│   │   ├── skill_analyzer.py
+│   │   ├── recommendation_engine.py
+│   │   ├── market_intelligence.py
+│   │   ├── strategic_planner.py
+│   │   └── optimization_algorithms.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── main.py
+│   │   ├── routers/
+│   │   │   ├── __init__.py
+│   │   │   ├── skills.py
+│   │   │   ├── recommendations.py
+│   │   │   ├── analytics.py
+│   │   │   └── market_intelligence.py
+│   │   ├── middleware/
+│   │   │   ├── __init__.py
+│   │   │   ├── auth.py
+│   │   │   ├── rate_limiter.py
+│   │   │   └── error_handler.py
+│   │   └── schemas/
+│   │       ├── __init__.py
+│   │       ├── request_models.py
+│   │       └── response_models.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── logger.py
+│       ├── validators.py
+│       ├── helpers.py
+│       └── constants.py
+├── models/
+│   ├── trained/
+│   │   └── model_metadata.json
+│   └── checkpoints/
+├── tests/
+│   ├── __init__.py
+│   ├── test_data_processing/
+│   │   ├── __init__.py
+│   │   ├── test_data_validator.py
+│   │   ├── test_feature_engineer.py
+│   │   └── test_relationship_mapper.py
+│   ├── test_models/
+│   │   ├── __init__.py
+│   │   ├── test_neural_architecture.py
+│   │   └── test_training_pipeline.py
+│   ├── test_analytics/
+│   │   ├── __init__.py
+│   │   ├── test_recommendation_engine.py
+│   │   └── test_market_intelligence.py
+│   ├── test_api/
+│   │   ├── __init__.py
+│   │   ├── test_skills_endpoint.py
+│   │   └── test_recommendations_endpoint.py
+│   └── fixtures/
+│       ├── sample_data.json
+│       └── test_responses.json
+├── notebooks/
+│   ├── 01_data_exploration.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   ├── 03_model_development.ipynb
+│   ├── 04_model_evaluation.ipynb
+│   └── 05_visualization_analysis.ipynb
+├── scripts/
+│   ├── train_model.py
+│   ├── evaluate_model.py
+│   ├── export_onnx.py
+│   ├── data_pipeline.py
+│   └── deploy_api.py
+├── docs/
+│   ├── API_DOCUMENTATION.md
+│   ├── MODEL_ARCHITECTURE.md
+│   ├── DEPLOYMENT_GUIDE.md
+│   └── USER_GUIDE.md
+├── deployment/
+│   ├── docker/
+│   │   ├── Dockerfile
+│   │   └── docker-compose.yml
+│   ├── kubernetes/
+│   │   ├── deployment.yaml
+│   │   └── service.yaml
+│   └── cloud/
+│       ├── aws/
+│       │   └── README.md
+│       └── azure/
+│           └── README.md
+├── .env.example
+├── .gitignore
+├── README.md
+├── requirements.txt
+└── setup.py
