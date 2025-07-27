@@ -139,21 +139,7 @@ The system follows a modular, microservices-oriented architecture with a clear d
       * `--port 8000`: Specifies the port to run the API on.
       * `--reload`: Enables auto-reloading of the server on code changes (useful for development).
 
-    The API will be accessible at `http://localhost:8000`. You can view the interactive API documentation (Swagger UI) at `http://localhost:8000/docs`.
-
-### Docker Deployment (Conceptual)
-
-For production deployment, Docker is recommended:
-
-1.  **Create a `Dockerfile`**: (See separate response for `Dockerfile` content if needed).
-2.  **Build the Docker Image**:
-    ```bash
-    docker build -t skill-intelligence-api .
-    ```
-3.  **Run the Docker Container**:
-    ```bash
-    docker run -p 8000:8000 skill-intelligence-api
-    ```
+    The API will be accessible at `http://localhost:8000`.
 
 ## 5\. API Endpoints
 
@@ -255,9 +241,3 @@ Contributions are welcome\! Please follow these steps:
 5.  Push to the branch (`git push origin feature/your-feature-name`).
 6.  Open a Pull Request.
 
-## 11\. License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details (assuming a LICENSE file exists in the project).
-
-```
-```
