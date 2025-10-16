@@ -1,4 +1,5 @@
-# src/analytics/skill_analyzer.py
+# src/analytics/skill_analyzer.py (Updated perform_skill_analysis and _get_difficulty_level)
+
 import os
 import pandas as pd
 import numpy as np
@@ -10,6 +11,8 @@ from fuzzywuzzy import fuzz
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Dict, Any, Optional
 from thefuzz import fuzz
+import networkx as nx
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -21,15 +24,30 @@ class SkillAnalyzer:
         self.bert_preprocess_model = None
         self.bert_encoder_model = None
         self.unique_categories = []
-        self.category_embeddings = None # Initialize to None
+        self.category_embeddings = None
+        self._skill_analysis_cache = {}
+        # Add attributes for loaded relationship graphs/matrices
+        self.prerequisite_graph = None
+        self.complementary_skills_graph = None
+        self.skill_similarity_matrix_df = None
+        self.skill_industry_affinity_df = None
+        self.category_hierarchy_graph = None
 
-        # Configuration (must match your training/model build script and temp.py)
+
         self.MODEL_SAVE_PATH = 'models/skill_intelligence_model.keras'
         self.PROCESSED_DATA_PATH = 'data/processed/encoded_features_for_model.parquet'
+
+        # Paths for relationship mapper outputs
+        self.PREREQUISITE_GRAPH_PATH = "data/processed/prerequisite_graph.gml"
+        self.COMPLEMENTARY_GRAPH_PATH = "data/processed/complementary_skills_graph.gml"
+        self.SKILL_SIMILARITY_MATRIX_PATH = "data/processed/skill_similarity_matrix.csv"
+        self.SKILL_INDUSTRY_AFFINITY_PATH = "data/processed/skill_industry_affinity.csv"
+        self.CATEGORY_HIERARCHY_PATH = "data/processed/category_hierarchy.gml"
+
+
         self.BERT_MODEL_URL = "https://tfhub.dev/tensorflow/small_bert/bert_en_uncased_L-2_H-128_A-2/1"
         self.BERT_PREPROCESS_URL = "https://tfhub.dev/tensorflow/bert_en_uncased_preprocess/3"
 
-        # Define the features that your model expects, based on neural_architecture.py
         self.NUMERICAL_FEATURES = [
             'learning_time_days', 'popularity_score', 'job_demand_score',
             'salary_impact_percent', 'future_relevance_score', 'learning_resources_quality',
@@ -50,12 +68,18 @@ class SkillAnalyzer:
             'industry_usage_text': 'industry_embedding_input'
         }
         
-        # Difficulty thresholds (0-1 scaled)
         self.DIFFICULTY_THRESHOLDS = {
-            'basic': 0.33,  # Skills with scaled difficulty <= 0.33
-            'medium': 0.66, # Skills with scaled difficulty > 0.33 and <= 0.66
-            'hard': 1.0     # Skills with scaled difficulty > 0.66
+            'basic': 0.33,
+            'medium': 0.66,
+            'hard': 1.0
         }
+
+        # Mapping for model output indices to target names (must match training_pipeline.py/evaluation_metrics.py)
+        self.REGRESSION_OUTPUT_NAMES = [
+            'future_relevance_score', 'job_demand_score', 'salary_impact_percent', 'learning_time_days'
+        ]
+        self.BINARY_CLASSIFICATION_OUTPUT_NAME = 'risk_of_obsolescence_binary'
+
 
     def _is_technology_extension_match(self, query: str, skill_name: str) -> bool:
         """Check if this is a case like 'Node' matching with 'Node.js'"""
@@ -82,7 +106,9 @@ class SkillAnalyzer:
         return False
 
     def load_resources(self):
-        """Loads the ML model, data, and BERT models into memory."""
+        """Loads the ML model, data, BERT models, and graph/matrix resources into memory."""
+        
+        # Load ML Model
         if self.model is None:
             if not os.path.exists(self.MODEL_SAVE_PATH):
                 raise RuntimeError(f"Model not found at {self.MODEL_SAVE_PATH}. Please train the model first.")
@@ -95,6 +121,7 @@ class SkillAnalyzer:
             except Exception as e:
                 raise RuntimeError(f"Error loading model: {e}")
 
+        # Load Processed Data
         if self.df_processed is None:
             if not os.path.exists(self.PROCESSED_DATA_PATH):
                 raise RuntimeError(f"Processed data not found at {self.PROCESSED_DATA_PATH}. Please run data processing pipeline first.")
@@ -105,11 +132,6 @@ class SkillAnalyzer:
 
                 # Ensure 'difficulty_level_scaled' is always present and numeric
                 if 'difficulty_level' in self.df_processed.columns:
-                    # Assuming 'difficulty_level' is a string like 'Beginner', 'Intermediate', 'Advanced'
-                    # or a numerical score that needs scaling to 0-1.
-                    # If it's categorical, map it to numerical scale (e.g., 0.1, 0.5, 0.9)
-                    # If it's already numerical but not scaled, scale it.
-                    # For this example, let's assume it's a numerical column that might need normalization.
                     if pd.api.types.is_numeric_dtype(self.df_processed['difficulty_level']):
                         min_diff = self.df_processed['difficulty_level'].min()
                         max_diff = self.df_processed['difficulty_level'].max()
@@ -124,12 +146,20 @@ class SkillAnalyzer:
                     logging.warning("Neither 'difficulty_level' nor 'difficulty_level_scaled' found in processed data. Setting 'difficulty_level_scaled' to 0.5 (medium).")
                     self.df_processed['difficulty_level_scaled'] = 0.5 # Default to medium if no info
 
-
+                # Ensure consistent 'industry_usage_text' for BERT
                 if 'industry_usage' in self.df_processed.columns and 'industry_usage_text' not in self.df_processed.columns:
+                    # Ensure industry_usage is parsed as list if it's stringified
+                    self.df_processed['industry_usage'] = self.df_processed['industry_usage'].apply(lambda x: eval(x) if isinstance(x, str) else x)
                     self.df_processed['industry_usage_text'] = self.df_processed['industry_usage'].apply(lambda x: " ".join(x) if isinstance(x, list) else str(x))
                 elif 'industry_usage' not in self.df_processed.columns and 'industry_usage_text' not in self.df_processed.columns:
                     logging.warning("Neither 'industry_usage' nor 'industry_usage_text' found in processed data. Setting 'industry_usage_text' to empty string.")
                     self.df_processed['industry_usage_text'] = ""
+
+                if 'prerequisites' in self.df_processed.columns and self.df_processed['prerequisites'].apply(type).eq(str).any():
+                    self.df_processed['prerequisites'] = self.df_processed['prerequisites'].apply(lambda x: eval(x) if isinstance(x, str) else x)
+                if 'complementary_skills' in self.df_processed.columns and self.df_processed['complementary_skills'].apply(type).eq(str).any():
+                    self.df_processed['complementary_skills'] = self.df_processed['complementary_skills'].apply(lambda x: eval(x) if isinstance(x, str) else x)
+
 
                 if 'description' not in self.df_processed.columns:
                     self.df_processed['description'] = self.df_processed['skill_name'].apply(lambda x: f"A fundamental skill related to {x}.")
@@ -138,6 +168,7 @@ class SkillAnalyzer:
             except Exception as e:
                 raise RuntimeError(f"Error loading processed data: {e}")
 
+        # Load BERT Models and pre-compute embeddings
         if self.bert_preprocess_model is None or self.bert_encoder_model is None:
             try:
                 logging.info(f"Loading BERT preprocessor from: {self.BERT_PREPROCESS_URL}")
@@ -145,7 +176,8 @@ class SkillAnalyzer:
                 logging.info(f"Loading BERT encoder from: {self.BERT_MODEL_URL}")
                 self.bert_encoder_model = hub.KerasLayer(self.BERT_MODEL_URL)
 
-                if 'skill_name_embedding_vector' not in self.df_processed.columns or self.df_processed['skill_name_embedding_vector'].isnull().any():
+                # Generate and store skill name embeddings if not present or invalid
+                if 'skill_name_embedding_vector' not in self.df_processed.columns or self.df_processed['skill_name_embedding_vector'].isnull().any() or not all(isinstance(x, np.ndarray) and x.shape == (128,) for x in self.df_processed['skill_name_embedding_vector'].dropna()):
                     logging.info("Generating BERT embeddings for all skill names in the dataset...")
                     all_skill_names = self.df_processed['skill_name'].tolist()
                     processed_texts = self.bert_preprocess_model(tf.constant(all_skill_names))
@@ -153,7 +185,7 @@ class SkillAnalyzer:
                     self.df_processed['skill_name_embedding_vector'] = list(skill_embeddings)
                     logging.info("Skill name embeddings generated and stored.")
                 else:
-                    logging.info("Skill name embeddings already present in data.")
+                    logging.info("Skill name embeddings already present and valid in data.")
                 
                 # Pre-compute category embeddings for faster semantic search
                 self.unique_categories = self.df_processed['category'].dropna().unique().tolist()
@@ -168,9 +200,56 @@ class SkillAnalyzer:
                 logging.error("Please ensure you have an active internet connection or the models are cached locally.")
                 raise RuntimeError(f"Failed to load BERT resources: {e}")
 
+        # Load Relationship Mapper Outputs
+        if self.prerequisite_graph is None:
+            if not os.path.exists(self.PREREQUISITE_GRAPH_PATH):
+                logging.warning(f"Prerequisite graph not found at {self.PREREQUISITE_GRAPH_PATH}. Roadmaps might be limited.")
+            else:
+                try:
+                    self.prerequisite_graph = nx.read_gml(self.PREREQUISITE_GRAPH_PATH)
+                    logging.info(f"Prerequisite graph loaded with {self.prerequisite_graph.number_of_nodes()} nodes and {self.prerequisite_graph.number_of_edges()} edges.")
+                except Exception as e:
+                    logging.error(f"Error loading prerequisite graph: {e}")
+                    self.prerequisite_graph = nx.DiGraph() # Initialize empty to avoid errors
+
+        if self.complementary_skills_graph is None:
+            if not os.path.exists(self.COMPLEMENTARY_GRAPH_PATH):
+                logging.warning(f"Complementary skills graph not found at {self.COMPLEMENTARY_GRAPH_PATH}. Recommendations might be less accurate.")
+            else:
+                try:
+                    self.complementary_skills_graph = nx.read_gml(self.COMPLEMENTARY_GRAPH_PATH)
+                    logging.info(f"Complementary skills graph loaded with {self.complementary_skills_graph.number_of_nodes()} nodes and {self.complementary_skills_graph.number_of_edges()} edges.")
+                except Exception as e:
+                    logging.error(f"Error loading complementary skills graph: {e}")
+                    self.complementary_skills_graph = nx.Graph() # Initialize empty
+
+        if self.skill_industry_affinity_df is None:
+            if not os.path.exists(self.SKILL_INDUSTRY_AFFINITY_PATH):
+                logging.warning(f"Skill-Industry Affinity matrix not found at {self.SKILL_INDUSTRY_AFFINITY_PATH}.")
+            else:
+                try:
+                    self.skill_industry_affinity_df = pd.read_csv(self.SKILL_INDUSTRY_AFFINITY_PATH, index_col=0)
+                    logging.info(f"Skill-Industry Affinity matrix loaded. Shape: {self.skill_industry_affinity_df.shape}")
+                except Exception as e:
+                    logging.error(f"Error loading skill-industry affinity matrix: {e}")
+                    self.skill_industry_affinity_df = pd.DataFrame() # Initialize empty
+
+        if self.category_hierarchy_graph is None:
+            if not os.path.exists(self.CATEGORY_HIERARCHY_PATH):
+                logging.warning(f"Category hierarchy graph not found at {self.CATEGORY_HIERARCHY_PATH}.")
+            else:
+                try:
+                    self.category_hierarchy_graph = nx.read_gml(self.CATEGORY_HIERARCHY_PATH)
+                    logging.info(f"Category hierarchy graph loaded with {self.category_hierarchy_graph.number_of_nodes()} nodes and {self.category_hierarchy_graph.number_of_edges()} edges.")
+                except Exception as e:
+                    logging.error(f"Error loading category hierarchy graph: {e}")
+                    self.category_hierarchy_graph = nx.DiGraph() # Initialize empty
+
+
     def prepare_model_input_from_series(self, row: pd.Series) -> Dict[str, np.ndarray]:
         """
         Prepares input dictionary for the Keras model from a single DataFrame row (pd.Series).
+        Ensures all expected input keys from neural_architecture.py are present.
         """
         model_input = {}
 
@@ -194,16 +273,25 @@ class SkillAnalyzer:
 
         # Text embeddings
         for original_text_feature, model_input_name in self.TEXT_FEATURES_MAPPING.items():
-            text_for_embedding = row.get(original_text_feature)
-            if original_text_feature == 'industry_usage_text' and 'industry_usage' in row and isinstance(row['industry_usage'], list):
+            # For list-like features, ensure they are converted to text string for embedding
+            text_for_embedding = ''
+            value = row.get(original_text_feature, None)
+            if value is not None and not (isinstance(value, (np.ndarray, list)) and pd.isna(value).any()):
+                if isinstance(row[original_text_feature], list):
+                    text_for_embedding = " ".join(row[original_text_feature])
+                else:
+                    text_for_embedding = str(row[original_text_feature])
+            elif original_text_feature == 'industry_usage_text' and 'industry_usage' in row and isinstance(row['industry_usage'], list):
                 text_for_embedding = " ".join(row['industry_usage'])
-
+            
+            # Check if pre-computed embedding exists and is valid
             if f"{original_text_feature}_embedding_vector" in row and isinstance(row[f"{original_text_feature}_embedding_vector"], np.ndarray):
                 model_input[model_input_name] = np.array([row[f"{original_text_feature}_embedding_vector"]]).astype(np.float32)
             else:
+                # Dynamically generate embedding if not pre-computed or invalid
                 text_value = str(text_for_embedding if text_for_embedding is not None else '')
                 logging.debug(f"Generating embedding for {original_text_feature}: '{text_value}'")
-                text_preprocessed = self.bert_preprocess_model([text_value])
+                text_preprocessed = self.bert_preprocess_model(tf.constant([text_value]))
                 text_embedding = self.bert_encoder_model(text_preprocessed)['pooled_output']
                 model_input[model_input_name] = text_embedding
 
@@ -212,6 +300,7 @@ class SkillAnalyzer:
     def get_skill_suggestions(self, skill_query: str) -> List[Dict[str, Any]]:
         """
         Finds and ranks skills based on fuzzy matching and semantic similarity.
+        Prioritizes exact matches, then tech extension matches, then high-score fuzzy, then semantic.
         """
         if self.df_processed is None or self.bert_preprocess_model is None or self.bert_encoder_model is None:
             raise RuntimeError("Resources not loaded for skill suggestions.")
@@ -269,7 +358,7 @@ class SkillAnalyzer:
 
         # 4. BERT-based Semantic Similarity Search
         try:
-            input_skill_processed = self.bert_preprocess_model([skill_query])
+            input_skill_processed = self.bert_preprocess_model(tf.constant([skill_query]))
             input_skill_embedding = self.bert_encoder_model(input_skill_processed)['pooled_output'].numpy()
 
             valid_embeddings_df = self.df_processed[self.df_processed['skill_name_embedding_vector'].apply(lambda x: isinstance(x, np.ndarray) and x.shape == (128,))]
@@ -319,52 +408,110 @@ class SkillAnalyzer:
 
         return unique_suggestions
 
+    # --- Updated perform_skill_analysis (clean, patched for BERT and industry_usage_text issues) ---
     def perform_skill_analysis(self, skill_name_query: str) -> Dict[str, Any]:
-        """
-        Performs the core skill analysis, including data retrieval, prediction, and formatting.
-        """
         if self.df_processed is None or self.model is None or self.bert_preprocess_model is None or self.bert_encoder_model is None:
             raise RuntimeError("SkillAnalyzer resources are not yet loaded.")
 
+        cache_key = skill_name_query.lower()
+        if cache_key in self._skill_analysis_cache:
+            logger.info(f"Returning cached analysis for skill: {skill_name_query}")
+            return self._skill_analysis_cache[cache_key]
+
         skill_name_lower_query = skill_name_query.lower()
-        found_skill_row = self.df_processed[self.df_processed['skill_name_lower'] == skill_name_lower_query]
-
-        if found_skill_row.empty:
-            suggestions = self.get_skill_suggestions(skill_name_query)
-            if suggestions and (suggestions[0]['score'] >= 0.9 or suggestions[0]['match_type'] in ['semantic', 'fuzzy', 'tech_extension'] and suggestions[0]['score'] >= 0.9):
-                logging.info(f"Using top suggestion '{suggestions[0]['skill_name']}' for query '{skill_name_query}'.")
-                found_skill_row = self.df_processed[self.df_processed['skill_name_lower'] == suggestions[0]['skill_name'].lower()]
-                if found_skill_row.empty:
-                    raise ValueError(f"Skill '{skill_name_query}' not found and top suggestion '{suggestions[0]['skill_name']}' could not be processed.")
-            else:
-                raise ValueError(
-                    f"Skill '{skill_name_query}' not found. No sufficiently close match found. "
-                    f"Suggestions: {[s['skill_name'] for s in suggestions[:3]] if suggestions else 'None'}"
-                )
-
-        skill_data = found_skill_row.iloc[0].to_dict()
-
-        if 'difficulty_level' in skill_data:
-            skill_data['difficulty_level_scaled'] = float(skill_data['difficulty_level'])
-        elif 'difficulty_level_scaled' not in skill_data:
-            skill_data['difficulty_level_scaled'] = 0.0
-        if 'learning_time_days' in skill_data:
-                skill_data['learning_time_days'] = int(round(float(skill_data['learning_time_days'])*(365)))
-        elif 'learning_time_days' not in skill_data:
-            skill_data['learning_time_days'] = 0
-        if 'salary_impact_percent' in skill_data:
-                skill_data['salary_impact_percent'] = int(round(float(skill_data['salary_impact_percent'])*(30)))
-        elif 'salary_impact_percent' not in skill_data:
-            skill_data['salary_impact_percent'] = 0
-        if 'industry_usage' in skill_data and isinstance(skill_data['industry_usage'], list):
-            skill_data['industry_usage_text'] = " ".join(skill_data['industry_usage'])
-        elif 'industry_usage_text' not in skill_data:
-            skill_data['industry_usage_text'] = ""
-
-        model_input_data = self.prepare_model_input_from_series(found_skill_row.iloc[0])
+        found_skill_row = pd.DataFrame()
 
         try:
-            predictions = self.model.predict(model_input_data)
+            mask = self.df_processed['skill_name_lower'] == skill_name_lower_query
+            found_skill_row = self.df_processed[mask].copy()
+            logger.info(f"Direct search for '{skill_name_query}': {len(found_skill_row)} matches found")
+        except Exception as e:
+            logger.error(f"Error during direct skill search for '{skill_name_query}': {e}")
+
+        if len(found_skill_row) == 0:
+            try:
+                suggestions = self.get_skill_suggestions(skill_name_query)
+                if suggestions:
+                    top_suggestion = suggestions[0]
+                    score_good = top_suggestion['score'] >= 0.9
+                    match_type_good = top_suggestion['match_type'] in ['exact', 'semantic', 'fuzzy', 'tech_extension']
+                    use_suggestion = score_good or (top_suggestion['score'] >= 0.8 and match_type_good)
+
+                    if use_suggestion:
+                        suggestion_mask = self.df_processed['skill_name_lower'] == top_suggestion['skill_name'].lower()
+                        found_skill_row = self.df_processed[suggestion_mask].copy()
+
+                        if len(found_skill_row) == 0:
+                            raise ValueError(f"Suggested skill '{top_suggestion['skill_name']}' not found in dataset")
+                    else:
+                        suggestion_names = [s['skill_name'] for s in suggestions[:3]]
+                        raise ValueError(
+                            f"Skill '{skill_name_query}' not found. Best suggestion '{top_suggestion['skill_name']}' "
+                            f"has insufficient score ({top_suggestion['score']:.2f}). "
+                            f"Available suggestions: {suggestion_names}"
+                        )
+                else:
+                    raise ValueError(f"Skill '{skill_name_query}' not found and no suggestions available")
+            except Exception as e:
+                raise ValueError(f"Could not find or suggest skill '{skill_name_query}': {str(e)}")
+
+        if len(found_skill_row) > 1:
+            logger.warning(f"Multiple skills found for '{skill_name_query}'. Analyzing the first match.")
+            found_skill_row = found_skill_row.iloc[[0]]
+
+        try:
+            skill_data = found_skill_row.iloc[0].to_dict()
+            actual_skill_name = skill_data.get('skill_name', skill_name_query)
+            logger.info(f"Processing skill data for: {actual_skill_name}")
+        except Exception as e:
+            raise ValueError(f"Could not extract data for skill '{skill_name_query}': {str(e)}")
+
+        try:
+            # Fix malformed industry_usage_text
+            if 'industry_usage_text' in skill_data:
+                raw_text = skill_data['industry_usage_text']
+                if isinstance(raw_text, str) and raw_text.startswith("["):
+                    try:
+                        parsed_list = eval(raw_text)
+                        if isinstance(parsed_list, list):
+                            skill_data['industry_usage_text'] = " ".join(parsed_list)
+                    except:
+                        skill_data['industry_usage_text'] = raw_text.replace("[", "").replace("]", "").replace("'", "")
+
+            if 'difficulty_level' in skill_data and pd.notna(skill_data['difficulty_level']):
+                if isinstance(skill_data['difficulty_level'], (int, float)):
+                    skill_data['difficulty_level_scaled'] = float(skill_data['difficulty_level'])
+                else:
+                    difficulty_map = {'Beginner': 0.1, 'Intermediate': 0.5, 'Advanced': 0.9}
+                    skill_data['difficulty_level_scaled'] = difficulty_map.get(str(skill_data['difficulty_level']).lower(), 0.5)
+            elif 'difficulty_level_scaled' not in skill_data or pd.isna(skill_data.get('difficulty_level_scaled')):
+                skill_data['difficulty_level_scaled'] = 0.5
+
+            # Normalize other key fields
+            for key, default, scale in [
+                ('learning_time_days', 30, 365),
+                ('salary_impact_percent', 15, 100),
+            ]:
+                if key in skill_data and pd.notna(skill_data[key]):
+                    val = skill_data[key]
+                    try:
+                        val = float(val)
+                        skill_data[key] = int(round(val * scale)) if val <= 1.0 else int(round(val))
+                    except:
+                        skill_data[key] = default
+                else:
+                    skill_data[key] = default
+
+            if 'description' not in skill_data or pd.isna(skill_data.get('description')):
+                skill_data['description'] = f"A skill related to {actual_skill_name}."
+
+        except Exception as e:
+            logger.error(f"Error processing skill data attributes: {e}")
+
+        try:
+            logger.info(f"Getting model predictions for: {actual_skill_name}")
+            model_input_data = self.prepare_model_input_from_series(found_skill_row.iloc[0])
+            predictions = self.model.predict(model_input_data, verbose=0)
 
             skill_data['predicted_future_relevance_score'] = None
             skill_data['predicted_salary_impact_percent'] = None
@@ -375,47 +522,48 @@ class SkillAnalyzer:
             if isinstance(predictions, dict):
                 if 'regression_outputs' in predictions:
                     reg_preds = predictions['regression_outputs'][0]
-                    if reg_preds.shape[0] >= 4:
-                        skill_data['predicted_future_relevance_score'] = float(reg_preds[0])
-                        skill_data['predicted_job_demand_score'] = float(reg_preds[1])
-                        skill_data['predicted_salary_impact_percent'] = float(reg_preds[2])
-                        skill_data['predicted_learning_time_days'] = float(reg_preds[3])
-
+                    skill_data['predicted_future_relevance_score'] = round(float(reg_preds[0]) * 10, 2)
+                    skill_data['predicted_job_demand_score'] = round(float(reg_preds[1]) * 10, 2)
+                    skill_data['predicted_salary_impact_percent'] = int(round(float(reg_preds[2]) * 100))
+                    skill_data['predicted_learning_time_days'] = int(round(float(reg_preds[3]) * 365))
                 if 'binary_classification_outputs' in predictions:
-                    bin_preds = predictions['binary_classification_outputs'][0][0]
-                    predicted_prob = float(tf.nn.sigmoid(bin_preds).numpy())
-                    skill_data['predicted_certification_available'] = bool(predicted_prob > 0.5)
+                    prob = float(tf.nn.sigmoid(predictions['binary_classification_outputs'][0][0]).numpy())
+                    skill_data['predicted_certification_available'] = bool(prob > 0.5)
 
-            elif isinstance(predictions, list) and len(predictions) >= 2:
+            elif isinstance(predictions, (list, tuple)) and len(predictions) >= 2:
                 reg_preds = predictions[0][0]
-                if reg_preds.shape[0] >= 4:
-                    skill_data['predicted_future_relevance_score'] = float(reg_preds[0])
-                    skill_data['predicted_job_demand_score'] = float(reg_preds[1])
-                    skill_data['predicted_salary_impact_percent'] = float(reg_preds[2])
-                    skill_data['predicted_learning_time_days'] = float(reg_preds[3])
-
                 bin_preds = predictions[1][0][0]
-                predicted_prob = float(tf.nn.sigmoid(bin_preds).numpy())
-                skill_data['predicted_certification_available'] = bool(predicted_prob > 0.5)
-            else:
-                logging.warning("Unexpected model prediction format.")
+                skill_data['predicted_future_relevance_score'] = round(float(reg_preds[0]) * 10, 2)
+                skill_data['predicted_job_demand_score'] = round(float(reg_preds[1]) * 10, 2)
+                skill_data['predicted_salary_impact_percent'] = int(round(float(reg_preds[2]) * 100))
+                skill_data['predicted_learning_time_days'] = int(round(float(reg_preds[3]) * 365))
+                prob = float(tf.nn.sigmoid(bin_preds).numpy())
+                skill_data['predicted_certification_available'] = bool(prob > 0.5)
 
         except Exception as e:
-            logging.error(f"Error during model prediction for skill '{skill_name_query}': {e}")
+            logger.error(f"Error during model prediction for skill '{actual_skill_name}': {e}", exc_info=True)
 
-        for key in list(skill_data.keys()):
-            if '_encoded' in key or '_embedding_vector' in key:
-                del skill_data[key]
-            if key == 'difficulty_level' and 'difficulty_level_scaled' in skill_data:
-                del skill_data[key]
-            if key == 'industry_usage' and 'industry_usage_text' in skill_data:
-                del skill_data[key]
+        # Cleanup
+        for col in list(skill_data):
+            if '_embedding_vector' in col or '_encoded' in col or col == 'skill_name_lower':
+                skill_data.pop(col, None)
+
+        if 'difficulty_level_scaled' in skill_data and 'difficulty_level' in skill_data:
+            skill_data.pop('difficulty_level', None)
+
+        if 'industry_usage_text' in skill_data and 'industry_usage' in skill_data:
+            skill_data.pop('industry_usage', None)
+
+        skill_data['skill_name'] = actual_skill_name
+        self._skill_analysis_cache[cache_key] = skill_data.copy()
+        logger.info(f"Successfully analyzed and cached skill: {actual_skill_name}")
 
         return skill_data
-
+    
     def _get_relevant_categories_from_goals(self, goals: List[str]) -> List[str]:
         """
         Enhanced goal matching: searches goals in category -> industry_usage -> complementary_skills
+        Leverages loaded category_hierarchy_graph for broader matches.
         """
         relevant_categories = set()
         if not self.unique_categories:
@@ -479,7 +627,7 @@ class SkillAnalyzer:
             # Step 4: Fallback to BERT semantic similarity if nothing found
             if not matched and self.category_embeddings is not None:
                 try:
-                    goal_processed = self.bert_preprocess_model([goal])
+                    goal_processed = self.bert_preprocess_model(tf.constant([goal]))
                     goal_embedding = self.bert_encoder_model(goal_processed)['pooled_output'].numpy()
                     
                     similarities = cosine_similarity(goal_embedding, self.category_embeddings)[0]
@@ -493,21 +641,47 @@ class SkillAnalyzer:
                 except Exception as e:
                     logging.warning(f"Could not semantically predict category for goal '{goal}': {e}")
 
+        # NEW: Expand matched categories using the category hierarchy graph
+        if self.category_hierarchy_graph:
+            expanded_categories = set(relevant_categories)
+            for cat in relevant_categories:
+                # Add child categories (more specific categories under a matched parent)
+                if cat in self.category_hierarchy_graph: # Check if node exists
+                    for child in nx.descendants(self.category_hierarchy_graph, cat):
+                        expanded_categories.add(child)
+                # Add parent categories (broader context for a matched specific category)
+                for ancestor in nx.ancestors(self.category_hierarchy_graph, cat):
+                     expanded_categories.add(ancestor)
+            relevant_categories = expanded_categories
+            logging.info(f"Categories expanded via hierarchy: {relevant_categories}")
+
         return list(relevant_categories)
 
 
     def _get_difficulty_level(self, score: float) -> str:
         """Categorizes a scaled difficulty score into 'basic', 'medium', or 'hard'."""
+        # Ensure score is a scalar float, in case it's a 0-dim numpy array or similar
+        if isinstance(score, np.ndarray):
+            if score.size == 1:
+                score = float(score.item()) # Extract scalar from 0-dim array
+            else:
+                # This case should ideally not happen if data preparation is correct.
+                # If it does, it indicates a deeper issue in how `score` is being passed.
+                logging.warning(f"'_get_difficulty_level' received a multi-element array: {score}. Using its mean for categorization.")
+                score = float(np.mean(score))
+
+
         if score <= self.DIFFICULTY_THRESHOLDS['basic']:
             return 'basic'
-        elif score <= self.DIFFICULTY_THRESHOLDS['medium']: # Corrected typo here
+        elif score <= self.DIFFICULTY_THRESHOLDS['medium']: # Corrected from DIFFICOLDS_THRESHOLDS
             return 'medium'
         else:
             return 'hard'
 
     def recommend_skills(self, user_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Enhanced skill recommendations with skill_type matching and improved goal recognition.
+        Enhanced skill recommendations using BERT, job demand, future relevance,
+        complementary skills graph, industry affinity, and skill type matching.
         """
         if self.df_processed is None or self.model is None or self.bert_preprocess_model is None or self.bert_encoder_model is None:
             raise RuntimeError("SkillAnalyzer resources are not yet loaded for recommendations.")
@@ -518,7 +692,7 @@ class SkillAnalyzer:
 
         for skill in user_profile['current_skills']:
             try:
-                processed_text = self.bert_preprocess_model([skill])
+                processed_text = self.bert_preprocess_model(tf.constant([skill]))
                 embedding = self.bert_encoder_model(processed_text)['pooled_output'].numpy()
                 user_skill_embeddings.append(embedding)
 
@@ -535,7 +709,7 @@ class SkillAnalyzer:
         user_goal_embeddings = []
         for goal in user_profile['goals']:
             try:
-                processed_text = self.bert_preprocess_model([goal])
+                processed_text = self.bert_preprocess_model(tf.constant([goal]))
                 embedding = self.bert_encoder_model(processed_text)['pooled_output'].numpy()
                 user_goal_embeddings.append(embedding)
             except Exception as e:
@@ -576,31 +750,28 @@ class SkillAnalyzer:
             'current_skill_match': valid_embeddings_df['skill_name_lower'].isin([s.lower() for s in user_profile['current_skills']]),
             'similarity_to_user_profile': similarities,
             'difficulty_level_scaled': valid_embeddings_df['difficulty_level_scaled'],
-            'industry_usage': valid_embeddings_df.get('industry_usage', pd.Series([""] * len(valid_embeddings_df))),
-            'complementary_skills': valid_embeddings_df.get('complementary_skills', pd.Series([""] * len(valid_embeddings_df)))
+            'industry_usage': valid_embeddings_df.get('industry_usage', pd.Series([[]] * len(valid_embeddings_df))), # Ensure this is a list
+            'complementary_skills': valid_embeddings_df.get('complementary_skills', pd.Series([[]] * len(valid_embeddings_df))) # Ensure this is a list
         })
 
+        # Exclude skills the user already has
         recommendations_df = recommendations_df[~recommendations_df['current_skill_match']]
 
-        # Get complementary skills for current user skills
+        # Get complementary skills for current user skills using the graph
         complementary_skills_for_current = set()
-        for skill in user_profile['current_skills']:
-            skill_lower = skill.lower()
-            matched_skills = self.df_processed[self.df_processed['skill_name_lower'] == skill_lower]
-            if not matched_skills.empty:
-                comp_skills_val = matched_skills.iloc[0].get('complementary_skills')
-                if isinstance(comp_skills_val, str):
-                    comp_skills = [s.strip() for s in comp_skills_val.split(',') if s.strip()]
-                elif isinstance(comp_skills_val, list):
-                    comp_skills = comp_skills_val
-                else:
-                    comp_skills = []
-                complementary_skills_for_current.update(comp_skills)
-
+        if self.complementary_skills_graph:
+            for skill in user_profile['current_skills']:
+                skill_lower = skill.lower()
+                # Find the exact skill name in the graph's nodes (case-sensitive as GML saves it)
+                graph_skill_name = next((node for node in self.complementary_skills_graph.nodes if node.lower() == skill_lower), None)
+                if graph_skill_name:
+                    for neighbor in self.complementary_skills_graph.neighbors(graph_skill_name):
+                        complementary_skills_for_current.add(neighbor)
+        
         recommendations_df['is_complementary'] = recommendations_df['skill_name'].apply(lambda x: x in complementary_skills_for_current)
         recommendations_df['is_goal_category'] = recommendations_df['category'].isin(relevant_goal_categories)
         
-        # NEW: Add skill type matching boost
+        # Add skill type matching boost
         recommendations_df['matches_user_skill_type'] = recommendations_df['skill_type'].apply(
             lambda x: x in user_skill_types if x else False
         )
@@ -617,20 +788,20 @@ class SkillAnalyzer:
 
         # Enhanced industry usage boost with multiple goal fields
         boost = 0.15
-        threshold = 75  # Slightly lower threshold
+        threshold = 75
         user_goals_lower = [goal.lower() for goal in user_profile['goals']]
 
         def enhanced_industry_usage_boost(row):
-            # Check industry_usage
-            industry_text = str(row['industry_usage']).lower()
+            # Check industry_usage (which should be a list by now)
+            industry_list_lower = [str(item).lower() for item in row['industry_usage']]
             for goal in user_goals_lower:
-                if fuzz.partial_ratio(goal, industry_text) >= threshold:
+                if any(fuzz.partial_ratio(goal, industry_item) >= threshold for industry_item in industry_list_lower):
                     return True
             
-            # Also check complementary_skills
-            comp_text = str(row['complementary_skills']).lower()
+            # Also check complementary_skills (which should be a list by now)
+            comp_list_lower = [str(item).lower() for item in row['complementary_skills']]
             for goal in user_goals_lower:
-                if fuzz.partial_ratio(goal, comp_text) >= threshold:
+                if any(fuzz.partial_ratio(goal, comp_item) >= threshold for comp_item in comp_list_lower):
                     return True
             
             return False
@@ -818,9 +989,10 @@ class SkillAnalyzer:
         """
         Generate an optimized learning roadmap with complementary skills integration.
         Builds upon existing recommendation system with prerequisite chains and learning phases.
+        Leverages loaded prerequisite_graph for dependency resolution.
         """
-        if self.df_processed is None or self.model is None:
-            raise RuntimeError("SkillAnalyzer resources are not yet loaded for roadmap generation.")
+        if self.df_processed is None or self.model is None or self.prerequisite_graph is None:
+            raise RuntimeError("SkillAnalyzer resources (model, data, prerequisite_graph) are not yet loaded for roadmap generation.")
         
         logger.info(f"Generating learning roadmap for {roadmap_length_weeks} weeks")
         
@@ -832,21 +1004,24 @@ class SkillAnalyzer:
             for target_skill in target_skills:
                 # Check if target skill exists in our dataset
                 skill_match = self.df_processed[self.df_processed['skill_name_lower'] == target_skill.lower()]
-                if not skill_match.empty and target_skill not in [rec['skill_name'] for rec in base_recommendations]:
+                if not skill_match.empty and target_skill.lower() not in [rec['skill_name'].lower() for rec in base_recommendations]:
                     # Add target skill with high priority score
                     base_recommendations.insert(0, {
                         'skill_name': skill_match.iloc[0]['skill_name'],
                         'score': 10.0,  # High priority for user-specified targets
                         'reason': f"User-specified target skill: {target_skill}",
-                        'category': skill_match.iloc[0]['category']
+                        'category': skill_match.iloc[0]['category'],
+                        'difficulty_level_scaled': skill_match.iloc[0]['difficulty_level_scaled'], # Need this for _create_learning_phases
+                        'learning_time_days': skill_match.iloc[0]['learning_time_days'] # Need this
                     })
         
-        # Step 3: Build prerequisite and complementary skill graph
-        skill_graph = self._build_skill_dependency_graph(base_recommendations, user_profile)
+        # Step 3: Build prerequisite and complementary skill graph (using loaded graphs)
+        # We pass self.prerequisite_graph directly and then filter/enrich it.
+        skill_graph_for_roadmap = self._build_skill_dependency_graph_for_roadmap(base_recommendations, user_profile)
         
         # Step 4: Create learning phases based on dependencies and difficulty
         learning_phases = self._create_learning_phases(
-            skill_graph, 
+            skill_graph_for_roadmap, # Use the prepared graph
             user_profile, 
             roadmap_length_weeks, 
             skills_per_phase
@@ -866,55 +1041,78 @@ class SkillAnalyzer:
             'roadmap_summary': self._generate_roadmap_summary(learning_phases)
         }
 
-    def _build_skill_dependency_graph(self, recommendations: List[Dict], user_profile: Dict) -> Dict[str, Dict]:
+    def _build_skill_dependency_graph_for_roadmap(self, recommendations: List[Dict], user_profile: Dict) -> Dict[str, Dict]:
         """
-        Build a graph of skill dependencies including prerequisites and complementary skills.
+        Build a graph of skill dependencies for roadmap generation, filtering out already known skills
+        and using the loaded prerequisite graph.
         """
-        skill_graph = {}
+        roadmap_skill_info = {}
         current_skills_lower = {skill.lower() for skill in user_profile['current_skills']}
         
+        # Create a subgraph from the loaded prerequisite graph containing only recommended skills and their direct prereqs
+        # This prevents including every skill in the original large graph if not relevant to roadmap.
+        relevant_nodes = set()
+        for rec in recommendations:
+            relevant_nodes.add(rec['skill_name'])
+            # Add its direct prerequisites from the global graph
+            if self.prerequisite_graph and rec['skill_name'] in self.prerequisite_graph:
+                for prereq in self.prerequisite_graph.predecessors(rec['skill_name']):
+                    relevant_nodes.add(prereq)
+        
+        # Filter the global graph or build a new one based on relevant_nodes
+        if self.prerequisite_graph:
+            # Ensure all nodes in relevant_nodes are actual nodes in the graph
+            # Some 'prereq' skills might not be in the original df_processed if they are external or newly added
+            # Filter relevant_nodes to only include those present in the actual graph nodes
+            filtered_relevant_nodes = [node for node in relevant_nodes if node in self.prerequisite_graph.nodes]
+            subgraph = self.prerequisite_graph.subgraph(filtered_relevant_nodes).copy()
+        else:
+            subgraph = nx.DiGraph()
+            subgraph.add_nodes_from([rec['skill_name'] for rec in recommendations])
+
+        # Populate roadmap_skill_info based on recommendations and graph data
         for rec in recommendations:
             skill_name = rec['skill_name']
-            skill_data = self.df_processed[self.df_processed['skill_name'] == skill_name]
+            skill_data_row = self.df_processed[self.df_processed['skill_name'] == skill_name]
             
-            if skill_data.empty:
+            if skill_data_row.empty:
+                logging.warning(f"Skill '{skill_name}' from recommendations not found in df_processed for roadmap. Skipping.")
                 continue
-                
-            skill_row = skill_data.iloc[0]
+
+            skill_data_row = skill_data_row.iloc[0]
+
+            # Determine prerequisites from the loaded graph, filtering out learned skills
+            prerequisites_for_roadmap = []
+            if skill_name in subgraph:
+                for prereq in subgraph.predecessors(skill_name):
+                    # Check if the prerequisite is an actual skill in our processed data
+                    if prereq.lower() not in current_skills_lower and prereq in self.df_processed['skill_name'].values:
+                        prerequisites_for_roadmap.append(prereq)
+                    # Handle external prerequisites (not in our dataset, but still a dependency)
+                    elif prereq.lower() not in current_skills_lower: # and prereq not in self.df_processed['skill_name'].values:
+                        prerequisites_for_roadmap.append(prereq) # Include external prereqs as dependencies
+
+
+            # Determine complementary skills from the loaded graph
+            complementary_skills_for_roadmap = []
+            if self.complementary_skills_graph and skill_name in self.complementary_skills_graph:
+                for comp_skill in self.complementary_skills_graph.neighbors(skill_name):
+                    # Only add complementary skills that are also in our recommendations or present in processed data
+                    if comp_skill.lower() not in current_skills_lower and comp_skill.lower() != skill_name.lower() \
+                       and comp_skill in self.df_processed['skill_name'].values: # ensure it's a "learnable" skill
+                        complementary_skills_for_roadmap.append(comp_skill)
             
-            # Extract prerequisites
-            prerequisites = []
-            prereq_text = skill_row.get('prerequisites', '')
-            if isinstance(prereq_text, str) and prereq_text:
-                prerequisites = [p.strip() for p in prereq_text.split(',') if p.strip()]
-            elif isinstance(prereq_text, list):
-                prerequisites = prereq_text
-                
-            # Filter prerequisites: only include those not already known by user
-            filtered_prerequisites = [
-                prereq for prereq in prerequisites 
-                if prereq.lower() not in current_skills_lower
-            ]
-            
-            # Extract complementary skills
-            complementary = []
-            comp_text = skill_row.get('complementary_skills', '')
-            if isinstance(comp_text, str) and comp_text:
-                complementary = [c.strip() for c in comp_text.split(',') if c.strip()]
-            elif isinstance(comp_text, list):
-                complementary = comp_text
-                
-            skill_graph[skill_name] = {
-                'prerequisites': filtered_prerequisites,
-                'complementary': complementary,
-                'difficulty': skill_row.get('difficulty_level_scaled', 0.5),
-                'learning_time': skill_row.get('learning_time_days', 30),
-                'category': skill_row.get('category', ''),
+            roadmap_skill_info[skill_name] = {
+                'prerequisites': prerequisites_for_roadmap,
+                'complementary': complementary_skills_for_roadmap,
+                'difficulty': skill_data_row.get('difficulty_level_scaled', 0.5),
+                'learning_time': skill_data_row.get('learning_time_days', 30), # Assuming this is raw days
+                'category': skill_data_row.get('category', ''),
                 'score': rec['score'],
                 'reason': rec['reason']
             }
         
-        return skill_graph
+        return roadmap_skill_info
 
     def _create_learning_phases(
         self, 
@@ -928,84 +1126,103 @@ class SkillAnalyzer:
         """
         phases = []
         learned_skills = set(skill.lower() for skill in user_profile['current_skills'])
-        remaining_skills = set(skill_graph.keys())
+        remaining_skills_names = set(skill_graph.keys())
         
         phase_number = 1
         weeks_per_phase = max(2, total_weeks // 6)  # Aim for ~6 phases
         
-        while remaining_skills and phase_number <= 6:  # Max 6 phases
-            phase_skills = []
+        while remaining_skills_names and phase_number <= 6:  # Max 6 phases to prevent infinite loops
+            phase_skills_list = []
             
-            # Find skills whose prerequisites are already learned
-            available_skills = []
-            for skill in remaining_skills:
-                skill_info = skill_graph[skill]
-                prereqs_met = all(
-                    prereq.lower() in learned_skills 
-                    for prereq in skill_info['prerequisites']
-                )
+            # Find skills whose prerequisites are already learned or are external (not in our graph)
+            available_skills_for_current_phase = []
+            for skill_name in remaining_skills_names:
+                skill_info = skill_graph[skill_name]
+                prereqs_met = True
+                for prereq in skill_info['prerequisites']:
+                    # A prerequisite is met if it's learned, OR if it's external (not a node in our roadmap_skill_info graph)
+                    if (prereq in skill_graph and prereq.lower() not in learned_skills) or \
+                       (prereq not in self.df_processed['skill_name'].values and prereq.lower() not in learned_skills):
+                        prereqs_met = False
+                        break
                 if prereqs_met:
-                    available_skills.append((skill, skill_info))
+                    available_skills_for_current_phase.append((skill_name, skill_info))
             
-            if not available_skills:
-                # If no skills available due to prerequisites, pick highest scored remaining
-                available_skills = [(skill, skill_graph[skill]) for skill in remaining_skills]
-            
-            # Sort by score and difficulty balance
-            available_skills.sort(key=lambda x: (-x[1]['score'], x[1]['difficulty']))
+            # If no skills are available based on prerequisites, this indicates a potential issue
+            # or all remaining skills have unmet external prerequisites.
+            if not available_skills_for_current_phase and remaining_skills_names:
+                logging.warning(f"No more skills with met prerequisites in phase {phase_number}. Remaining: {list(remaining_skills_names)}")
+                # Break if no progress can be made
+                break 
+
+            # Sort by score (higher is better) and then difficulty (lower is better for earlier phases)
+            available_skills_for_current_phase.sort(key=lambda x: (-x[1]['score'], x[1]['difficulty']))
             
             # Select skills for this phase
             selected_count = 0
-            for skill, skill_info in available_skills:
+            temp_skills_added_this_phase = set() # To prevent adding duplicates within a phase
+
+            for skill_name, skill_info in available_skills_for_current_phase:
                 if selected_count >= skills_per_phase:
                     break
-                    
-                phase_skills.append({
-                    'skill_name': skill,
+                
+                if skill_name.lower() in learned_skills or skill_name.lower() in temp_skills_added_this_phase: # Prevent duplicates
+                    continue
+
+                phase_skills_list.append({
+                    'skill_name': skill_name,
                     'difficulty': self._get_difficulty_level(skill_info['difficulty']),
-                    'estimated_days': int(skill_info['learning_time']),
+                    'estimated_days': int(round(float(skill_info['learning_time']) * (365/100))), # Inverse scale learning time back to days (assuming 0-1 mapped to 0-100)
                     'category': skill_info['category'],
                     'prerequisites': skill_info['prerequisites'],
                     'complementary': skill_info['complementary'],
                     'reason': skill_info['reason']
                 })
                 
-                learned_skills.add(skill.lower())
-                remaining_skills.remove(skill)
+                learned_skills.add(skill_name.lower())
+                temp_skills_added_this_phase.add(skill_name.lower())
+                remaining_skills_names.remove(skill_name)
                 selected_count += 1
                 
-                # Add highly relevant complementary skills if space allows
-                if selected_count < skills_per_phase:
-                    for comp_skill in skill_info['complementary'][:1]:  # Max 1 complementary per skill
-                        if (comp_skill in skill_graph and 
-                            comp_skill in remaining_skills and 
-                            selected_count < skills_per_phase):
+                # Add highly relevant complementary skills if space allows (from the loaded graph)
+                # Only if the complementary skill is also in the overall skill_graph (i.e., it's a known skill in our dataset)
+                # and not already learned or added to this phase.
+                if self.complementary_skills_graph:
+                    for comp_skill_name_candidate in skill_info['complementary']:
+                        if (selected_count < skills_per_phase and
+                            comp_skill_name_candidate in skill_graph and # Must be a skill in our current roadmap scope
+                            comp_skill_name_candidate.lower() not in learned_skills and
+                            comp_skill_name_candidate.lower() not in temp_skills_added_this_phase):
                             
-                            comp_info = skill_graph[comp_skill]
-                            phase_skills.append({
-                                'skill_name': comp_skill,
+                            comp_info = skill_graph[comp_skill_name_candidate]
+                            phase_skills_list.append({
+                                'skill_name': comp_skill_name_candidate,
                                 'difficulty': self._get_difficulty_level(comp_info['difficulty']),
-                                'estimated_days': int(comp_info['learning_time']),
+                                'estimated_days': int(round(float(comp_info['learning_time']) * (365/100))),
                                 'category': comp_info['category'],
                                 'prerequisites': comp_info['prerequisites'],
                                 'complementary': comp_info['complementary'],
-                                'reason': f"Complementary to {skill}: {comp_info['reason']}"
+                                'reason': f"Complementary to {skill_name}: {comp_info['reason']}"
                             })
                             
-                            learned_skills.add(comp_skill.lower())
-                            remaining_skills.remove(comp_skill)
+                            learned_skills.add(comp_skill_name_candidate.lower())
+                            temp_skills_added_this_phase.add(comp_skill_name_candidate.lower())
+                            if comp_skill_name_candidate in remaining_skills_names:
+                                remaining_skills_names.remove(comp_skill_name_candidate)
                             selected_count += 1
             
-            if phase_skills:
+            if phase_skills_list: # Check if any skills were added in this phase
                 phases.append({
-                    'phase': phase_number,
-                    'skills': phase_skills,
+                    'phase_number': phase_number,
+                    'start_week': (phase_number - 1) * weeks_per_phase + 1,
+                    'end_week': phase_number * weeks_per_phase,
+                    'skills': phase_skills_list,
                     'estimated_weeks': weeks_per_phase,
-                    'focus': self._determine_phase_focus(phase_skills)
+                    'focus': self._determine_phase_focus(phase_skills_list)
                 })
                 phase_number += 1
             else:
-                break  # No more skills to add
+                break  # No more skills could be added to any phase
         
         return phases
 
@@ -1017,19 +1234,20 @@ class SkillAnalyzer:
         current_week = 1
         
         for phase in phases:
-            phase_weeks = min(phase['estimated_weeks'], total_weeks - current_week + 1)
+            # Ensure cumulative weeks don't exceed total_weeks
+            phase_duration = min(phase['estimated_weeks'], total_weeks - current_week + 1)
             
             phase_timeline = {
-                'phase_number': phase['phase'],
+                'phase_number': phase['phase_number'],
                 'start_week': current_week,
-                'end_week': current_week + phase_weeks - 1,
+                'end_week': current_week + phase_duration - 1,
                 'skills': phase['skills'],
                 'focus': phase['focus'],
-                'milestones': self._generate_phase_milestones(phase['skills'], phase_weeks)
+                'milestones': self._generate_phase_milestones(phase['skills'], phase_duration)
             }
             
             timeline.append(phase_timeline)
-            current_week += phase_weeks
+            current_week += phase_duration
             
             if current_week > total_weeks:
                 break
@@ -1147,7 +1365,7 @@ class SkillAnalyzer:
                 'medium': difficulties.count('medium'),
                 'hard': difficulties.count('hard')
             },
-            'estimated_total_time': f"{sum(phase['estimated_weeks'] for phase in phases)} weeks"
+            'estimated_total_time': f"{sum(phase.get('estimated_weeks', 0) for phase in phases)} weeks"
         }
     def compute_user_matching_score(self, userA: dict, userB: dict) -> dict:
         """
@@ -1245,7 +1463,7 @@ class SkillAnalyzer:
         matches = []
         for peer in peer_profiles:
             score_info = self.compute_user_matching_score(user_profile, peer)
-            match = dict(peer)  # copy peer info
+            match = dict(peer)
             match["matching_details"] = score_info
             matches.append(match)
         # Sort by descending score
@@ -1351,9 +1569,22 @@ class SkillAnalyzer:
                 skill_data = self.perform_skill_analysis(skill)
                 
                 # Extract scores from the analyzed skill data
-                job_demand = skill_data.get('job_demand_score', 0.5)
-                salary_impact = skill_data.get('salary_impact_percent', 0) / 100.0  # Convert to 0-1 scale
-                future_relevance = skill_data.get('future_relevance_score', 0.5)
+                # ENSURE a numeric default (e.g., 5.0 or 0.5) if predicted_ score is None
+                # or if original score is None.
+                job_demand = skill_data.get('predicted_job_demand_score') # Get predicted, which might be None
+                if job_demand is None:
+                    job_demand = skill_data.get('job_demand_score', 5.0) # Fallback to original, then default
+                job_demand = float(job_demand) / 10.0 # Scale to 0-1 from 0-10
+
+                salary_impact = skill_data.get('predicted_salary_impact_percent')
+                if salary_impact is None:
+                    salary_impact = skill_data.get('salary_impact_percent', 50)
+                salary_impact = float(salary_impact) / 100.0  # Convert to 0-1 scale
+
+                future_relevance = skill_data.get('predicted_future_relevance_score')
+                if future_relevance is None:
+                    future_relevance = skill_data.get('future_relevance_score', 5.0)
+                future_relevance = float(future_relevance) / 10.0 # Scale to 0-1 from 0-10
                 
                 # Combine the scores with weights
                 skill_score = (
@@ -1364,13 +1595,14 @@ class SkillAnalyzer:
                 skill_scores.append(skill_score)
                 
             except (ValueError, RuntimeError) as e:
-                # If skill analysis fails, use default score
-                logger.warning(f"Could not analyze skill '{skill}': {e}")
+                # If skill analysis fails or individual score extraction fails, use default score
+                logger.warning(f"Could not analyze skill '{skill}' for portfolio score: {e}")
                 skill_scores.append(0.3)  # Default for unknown/unanalyzable skills
+            except TypeError as e: # Catch if float() conversion on None fails more directly
+                logger.error(f"TypeError during score conversion for skill '{skill}': {e}. Value was likely None unexpectedly.")
+                skill_scores.append(0.3)
         
         return np.mean(skill_scores) if skill_scores else 0.0
-
-
     def _calculate_goal_alignment_score(self, goals: list, current_skills: list) -> float:
         """Calculate how well current skills align with stated goals using skill analysis"""
         if not goals:
@@ -1393,6 +1625,10 @@ class SkillAnalyzer:
                         fuzz.partial_ratio(goal, industry_text) >= 70 
                         for goal in goals
                     )
+                    # Check for partial_match (boolean Series)
+                    if isinstance(partial_match, pd.Series): # Add this check for safety
+                        partial_match = partial_match.any() # Take .any() if it's a Series
+
                     alignment_scores.append(0.7 if partial_match else 0.3)
                     
             except (ValueError, RuntimeError):
@@ -1401,7 +1637,7 @@ class SkillAnalyzer:
         return np.mean(alignment_scores) if alignment_scores else 0.0
 
     def _calculate_skill_diversity_score(self, current_skills: list) -> float:
-        """Calculate diversity and complementarity using skill analysis"""
+        """Calculate diversity and complementarity using skill analysis and complementary graph"""
         if len(current_skills) < 2:
             return 0.3  # Low diversity for single skills
         
@@ -1416,17 +1652,11 @@ class SkillAnalyzer:
                 categories.add(skill_data.get('category', ''))
                 skill_types.add(skill_data.get('skill_type', ''))
                 
-                # Check for complementary skills
-                comp_skills = skill_data.get('complementary_skills', [])
-                if isinstance(comp_skills, list):
-                    comp_list = [c.strip().lower() for c in comp_skills]
-                elif isinstance(comp_skills, str):
-                    comp_list = [c.strip().lower() for c in comp_skills.split(',')]
-                else:
-                    comp_list = []
-                    
-                overlap = set(comp_list) & set([s.lower() for s in current_skills])
-                complementary_bonus += len(overlap) * 0.1
+                # Check for complementary skills using the loaded graph
+                if self.complementary_skills_graph and skill in self.complementary_skills_graph: # Check if skill is a node in the graph
+                    for comp_skill in self.complementary_skills_graph.neighbors(skill):
+                        if comp_skill.lower() in [s.lower() for s in current_skills]:
+                            complementary_bonus += 0.1 # Small bonus for having complementary skills together
                 
             except (ValueError, RuntimeError):
                 continue  # Skip skills that can't be analyzed
@@ -1445,7 +1675,7 @@ class SkillAnalyzer:
         for skill in current_skills:
             try:
                 skill_data = self.perform_skill_analysis(skill)
-                demand_scores.append(skill_data.get('job_demand_score', 0.5))
+                demand_scores.append(skill_data.get('predicted_job_demand_score', skill_data.get('job_demand_score', 5.0)) / 10.0) # Use predicted if available, scale to 0-1
             except (ValueError, RuntimeError):
                 demand_scores.append(0.3)
         
@@ -1459,7 +1689,7 @@ class SkillAnalyzer:
         for skill in current_skills:
             try:
                 skill_data = self.perform_skill_analysis(skill)
-                future_scores.append(skill_data.get('future_relevance_score', 0.5))
+                future_scores.append(skill_data.get('predicted_future_relevance_score', skill_data.get('future_relevance_score', 5.0)) / 10.0) # Use predicted if available, scale to 0-1
             except (ValueError, RuntimeError):
                 future_scores.append(0.3)
         
@@ -1481,7 +1711,8 @@ class SkillAnalyzer:
         for skill in current_skills:
             try:
                 skill_data = self.perform_skill_analysis(skill)
-                if skill_data.get('job_demand_score', 0) > 0.7:
+                # Use predicted if available, compare to 7 (out of 10)
+                if skill_data.get('predicted_job_demand_score', skill_data.get('job_demand_score', 0)) > 7:
                     high_value_skills.append(skill.title())
             except (ValueError, RuntimeError):
                 continue
