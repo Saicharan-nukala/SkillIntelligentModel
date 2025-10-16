@@ -13,7 +13,7 @@ my_tf_env_wsl/
 .idea/
 deployment/
 # Data & models
-data/
+
 models/checkpoints/
 *.h5
 *.pkl
