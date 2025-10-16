@@ -1,3 +1,5 @@
+setuptools>=68.0
+wheel>=0.40
 absl-py==2.3.0
 annotated-types==0.7.0
 anyio==4.9.0
