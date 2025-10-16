@@ -457,3 +457,13 @@ async def calculate_user_market_position(request: dict):
             "success": False,
             "error": f"Failed to calculate market position: {str(e)}"
         }
+
+if __name__ == "__main__":
+    # Get the port from environment variable (Render sets $PORT)
+    port = int(os.environ.get("PORT", 8000))  # fallback for local testing
+    uvicorn.run(
+        "src.api.main:app", 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info"
+    )
