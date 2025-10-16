@@ -12,3 +12,4 @@ RapidFuzz==3.13.0
 tensorflow-cpu==2.10.0
 tensorflow-hub==0.16.1
 h5py==3.14.0  # only if your API loads .h5 model
+tensorflow-text==2.10.0
