@@ -17,7 +17,8 @@ venv/
 .idea/
 
 # Data folders and notebooks
-data/
+data/raw/
+data/schemas/
 notebooks/
 tests/
 models/checkpoints/
